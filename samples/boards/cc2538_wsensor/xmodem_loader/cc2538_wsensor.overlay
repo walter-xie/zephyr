@@ -1,0 +1,13 @@
+/ {
+	chosen {
+		zephyr,flash = &flash1;
+	};
+};
+
+&uart0 {
+	status = "disabled";
+};
+
+&rf0 {
+	status = "disabled";
+};

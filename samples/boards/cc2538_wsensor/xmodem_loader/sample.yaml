@@ -1,0 +1,18 @@
+sample:
+  description: xmodem boot loader for cc2538_wsensor board.
+    application
+  name: xmodem loader
+  platforms: cc2538_wsensor
+common:
+    tags: samples
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - "Hello World! (.*)"
+tests:
+  singlethread:
+    extra_args: CONF_FILE=prj_single.conf
+    filter: not CONFIG_BT and not CONFIG_GPIO_SCH and ASSERT == 0
+  test:
+    tags: samples

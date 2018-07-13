@@ -1,0 +1,437 @@
+
+#include <zephyr.h>
+#include <string.h>
+#include <uart.h>
+#include <crc16.h>
+#include <misc/printk.h>
+#include <flash.h>
+#include <watchdog.h>
+
+#define BOOT_VERSION  "V100"
+
+
+char const s_u8BoardName[] = "ENT2CTLA_2538";
+
+#define FLASH_BASE_ADDR               0x200000                             
+#define APP_RUN_IMG_MAX_SIZE         (200*1024)
+#define APP_SOFTWARE_BK_LZMA_MAX_SIZE (140*1024)
+#define FLASH_SECTOR_SIZES            2048
+
+#define APP_RUN_START_ADDR FLASH_BASE_ADDR
+#define APP_RESET_ADD     (FLASH_BASE_ADDR+4)
+#define APP_BK_LZMA_ST_ADDR (FLASH_BASE_ADDR+APP_RUN_IMG_MAX_SIZE)
+
+#define IH_NMLEN         32
+#define IH_MAGIC         0x54CC2538
+#define IH_IMG_BIOS      0
+#define IH_IMG_APP       1
+#define BOARD_TYPE		 0xCC
+#define SOFTWARE_ID      1
+#define IH_LZMA_IMG      1
+
+#define XMODEM_OK 0
+
+#define FLASH_DEV_NAME "flash"
+#define WATCHDOG_DEV_NAME "WDT"
+
+static struct device *uart_console_dev=(struct device *)0;
+static struct device *flash_dev=(struct device *)0;
+static struct device *wdg_dev=(struct device *)0;
+
+extern int lzma_update(int (*Read)(void *, void *, int *),int (*Write)(void *, const void *, int));
+
+static void WdgClear(void)
+{
+	if((struct device *)0 != wdg_dev)
+	{
+		wdt_reload(wdg_dev);
+	}
+}
+
+static int FlashErase(unsigned int u32FlashStartAddr,int i32FlashSizes)
+{
+	u32FlashStartAddr -= FLASH_BASE_ADDR;
+	while(i32FlashSizes > 0)
+	{
+		if ( 0!= flash_erase(flash_dev,u32FlashStartAddr, FLASH_SECTOR_SIZES))
+		{
+			return -1;
+		}
+		u32FlashStartAddr += FLASH_SECTOR_SIZES;
+		i32FlashSizes -= FLASH_SECTOR_SIZES;
+		WdgClear();
+	}
+	return 0;
+}
+
+static int FlashWrite(unsigned int u32FlashAddr,unsigned char *pData,int i32DataLen)
+{
+	if (0 == i32DataLen){
+		return 0;
+	}
+	u32FlashAddr -= FLASH_BASE_ADDR;
+	return flash_write(flash_dev,u32FlashAddr,pData, i32DataLen);
+}
+
+
+typedef struct  image_header {
+    unsigned char	ih_name[IH_NMLEN];  /* Image Name		*/
+    unsigned int	ih_magic;           /* Image Header Magic Number	*/
+    unsigned int	ih_size;            /* Image Data Size,not include image header*/
+    unsigned int	ih_load;            /* Data	 Load  Address		*/
+    unsigned short	ih_dcrc;            /* Image Data CRC Checksum,not include image header*/
+    unsigned short  ih_vers;            /* Image version*/
+    unsigned char	ih_arch;            /* CPU architecture		*/
+    unsigned char 	ih_boardtype;       /* Board type*/
+    unsigned char 	ih_manufacturer;    /* manufacturer*/
+    unsigned char   ih_imagetype;       /* Image type*/
+	unsigned char   ih_boottype;        /* Boot type*/
+    unsigned char   ih_rfu0[64];        /* Reserve for fucture use*/
+    unsigned char   ih_software_id;     /* Software ID*/
+	unsigned char   ih_compress_type;   /* Image compress type*/
+    unsigned char   ih_rfu1[9];        /* Reserve for fucture use*/
+} image_header_t;
+
+static int CheckImgHeader(unsigned char *pBuf)
+{
+    image_header_t *pImage_Header = (image_header_t*)pBuf;
+
+	if ((0 != memcmp((char*)s_u8BoardName, (char*)(pImage_Header->ih_name), strlen(s_u8BoardName)))
+		|| (BOARD_TYPE	!= pImage_Header->ih_boardtype)
+		|| (IH_IMG_APP	< pImage_Header->ih_imagetype)
+		|| (SOFTWARE_ID != pImage_Header->ih_software_id)
+		|| (IH_MAGIC    != pImage_Header->ih_magic)
+		|| ((APP_SOFTWARE_BK_LZMA_MAX_SIZE < pImage_Header->ih_size)
+		     &&(IH_LZMA_IMG == pImage_Header->ih_compress_type)))
+	{
+        return -1;
+	}
+	return XMODEM_OK;
+}
+
+static int GetImageCompressType(unsigned char *pBuf)
+{
+	image_header_t *pImage_Header = (image_header_t*)pBuf;
+	return pImage_Header->ih_compress_type;
+}
+
+static int CheckImgContent_Lzma(unsigned int ImageAddr)
+{
+	image_header_t *pImage_Header = (image_header_t*)ImageAddr;
+	unsigned char *pcrc = (unsigned char *)(ImageAddr+sizeof(image_header_t)+pImage_Header-> ih_size);
+	if (pImage_Header->ih_dcrc != ((pcrc[1]<<8)+pcrc[0]))
+		return -1;
+	WdgClear();
+	unsigned short ImgCrc = crc16_itu_t( 0,(unsigned char *) (ImageAddr+sizeof(image_header_t)), pImage_Header-> ih_size);
+	WdgClear();
+	if (ImgCrc != pImage_Header->ih_dcrc)
+		return -2;
+	return XMODEM_OK;
+}
+
+static bool g_bImageLzma = false;
+
+#define SOH  0x01
+#define STX  0x02
+#define EOT  0x04
+#define ACK  0x06
+#define NAK  0x15
+#define CAN  0x18
+#define CTRLZ 0x1A
+#define ESC   0X1B
+
+#define DLY_1S 0x6fff0
+#define MAXRETRANS 25
+#define TRANSMIT_XMODEM_1K
+
+static void _outbyte(unsigned char c)
+{
+	(void)uart_poll_out(uart_console_dev,c);
+}
+
+static int _inbyte(int waitTime)
+{
+    int rec=-1;
+	unsigned char rev_char;
+
+    while(rec < 0)
+    {
+        rec = uart_poll_in(uart_console_dev, &rev_char);
+        if(waitTime-- < 0)
+        {
+			WdgClear();
+            return -1;
+        }
+    }
+	WdgClear();
+    return rev_char;
+}
+
+static void flushinput(void)
+{
+	while (_inbyte(DLY_1S) >= 0)
+		;
+}
+
+static inline void CancelXModem(void)
+{
+	_outbyte(CAN);
+	_outbyte(CAN);
+	_outbyte(CAN);
+}
+
+static int cb_revOneFrame(unsigned int frameno, unsigned char *data, int framesz)
+{
+	static unsigned int AppAddress;
+	static int AppMaxSizes;
+	
+	if (1 == frameno)
+	{
+		if (XMODEM_OK != CheckImgHeader(data))
+		{
+			CancelXModem();
+			//image_header_t *pImage_Header=(image_header_t *)data;
+			//printk("ih_name=%s,ih_magic=%X\n",pImage_Header->ih_name,pImage_Header->ih_magic);
+			//printk("ih_software_id=%d,ih_imagetype=%X\n",pImage_Header->ih_software_id,pImage_Header->ih_imagetype);
+			//printk("ih_boardtype=%X\n",pImage_Header->ih_boardtype);
+			printk("\nInvalid Image\n");
+			return -1;
+		}
+		if (IH_LZMA_IMG == GetImageCompressType(data))
+		{
+			g_bImageLzma = true;
+			AppAddress = APP_BK_LZMA_ST_ADDR;
+			AppMaxSizes = APP_SOFTWARE_BK_LZMA_MAX_SIZE;
+		}
+		else
+		{
+			g_bImageLzma = false;
+			AppAddress = APP_RUN_START_ADDR;
+			AppMaxSizes = APP_RUN_IMG_MAX_SIZE + APP_SOFTWARE_BK_LZMA_MAX_SIZE;
+			data += sizeof(image_header_t);
+			framesz -= sizeof(image_header_t);
+		}
+
+		if(0 != FlashErase(AppAddress, AppMaxSizes))
+		{
+			CancelXModem();
+			printk("\n********Flash Erase Error!\n");
+			return -2;
+		}
+	}
+	if (AppMaxSizes < 0){
+		CancelXModem();
+		printk("\n********File size > MaxSizes\n");
+		return -3;
+	}
+	WdgClear();
+	//将收到数据写入Flash中
+	if (FlashWrite(AppAddress,data, framesz) != 0)
+	{
+		CancelXModem();
+		printk("\n********Write flash fail\n");
+		return -4;
+	}
+	AppAddress += framesz;
+	AppMaxSizes -= framesz;
+	return framesz;
+}
+
+static int check(const unsigned char *buf, int sz)
+{
+	unsigned short crc = crc16_itu_t(0,buf, sz);
+	unsigned short tcrc = (buf[sz]<<8)+buf[sz+1];
+	if (crc == tcrc)
+		return 1;
+	return 0;
+}
+
+int xmodemReceive(void)
+{
+	static unsigned char rxbuf[1030]; /* 1 nul + 3 head chars + 1024 for XModem 1k  + 2 crc*/
+	unsigned char *p;
+	int framesz;
+	unsigned char trychar = 'C';
+	unsigned char packetno = 1;
+	unsigned int frameno = 1;
+	int i, c;
+	int retry, retrans = MAXRETRANS;
+
+	for(;;) {
+		for( retry = 0; retry < 120; ++retry) {
+			if (trychar) _outbyte(trychar);
+			if ((c = _inbyte((DLY_1S)<<1)) >= 0) {
+				switch (c) {
+				case SOH:
+					framesz = 128;
+					goto start_recv;
+				case STX:
+					framesz = 1024;
+					goto start_recv;
+				case EOT:
+					flushinput();
+					_outbyte(ACK);
+					return XMODEM_OK; /* normal end */
+				case CAN:
+					if ((c = _inbyte(DLY_1S)) == CAN) {
+						flushinput();
+						_outbyte(ACK);
+						return -1; /* canceled by remote */
+					}
+					break;
+				case 'r':
+                case 'R':
+                    printk("\nReset!\n");
+                    while(1){}
+				default:
+					break;
+				}
+			}
+		}
+		flushinput();
+		CancelXModem();
+		return -2; /* sync error */
+
+	start_recv:
+		trychar = 0;
+		p = &rxbuf[2];/*rxbuf[0] for gap. rxbuf[1] for SOH/STX. */
+		for (i = 0;  i < (framesz+4); ++i) {
+			if ((c = _inbyte(DLY_1S)) < 0) goto reject;
+			*p++ = c;
+		}
+
+		if (rxbuf[2] == (unsigned char)(~rxbuf[3]) && 
+			(rxbuf[2] == packetno || rxbuf[2] == (unsigned char)packetno-1) &&
+			check(&rxbuf[4], framesz)) {
+			if (rxbuf[2] == packetno)	{
+				if (framesz != cb_revOneFrame(frameno,&rxbuf[4],framesz)){
+					return -4; /* callback func error */
+				}
+				++packetno;
+				++frameno;
+				retrans = MAXRETRANS+1;
+			}
+			if (--retrans <= 0) {
+				flushinput();
+				CancelXModem();
+				return -3; /* too many retry error */
+			}
+			_outbyte(ACK);
+			continue;
+		}
+	reject:
+		flushinput();
+		_outbyte(NAK);
+	}
+}
+
+/*******************************************************************************
+* Function Name : JumpToApp
+* Description : 跳转到APP主程序
+* Input : None
+* Output : None
+* Return : None
+*******************************************************************************/
+void JumpToApp(void)
+{
+	unsigned int AppAddress;
+	AppAddress = *((unsigned int *)(APP_RESET_ADD));
+	printk("\nJump To App\n");
+	printk("PC_POINTER = 0x%X\n",AppAddress);
+    WdgClear();
+	/*程序跳转到APPADDRESS地址出执行*/
+	((void ( *)(void))(AppAddress))();
+}
+
+static unsigned int s_AppAddress=APP_RUN_START_ADDR;
+static unsigned int s_AppAddress_lzma=APP_BK_LZMA_ST_ADDR+sizeof(image_header_t);
+static int MyRead(void *p, void *buf, int *size)
+{
+  (void)p;
+  memcpy(buf,(void *)s_AppAddress_lzma,*size);
+  s_AppAddress_lzma += *size;
+  return 0;
+}
+static int MyWrite(void *p, const void *buf, int size)
+{
+  (void)p;
+  if ( 0 != FlashWrite(s_AppAddress, (unsigned char *)buf, size))
+  {
+	return -1;
+  }
+  WdgClear();
+  s_AppAddress += size;
+  return size;
+}
+
+static void UpdateRunApp_Lzma(void)
+{
+	(void)FlashErase(APP_RUN_START_ADDR, APP_RUN_IMG_MAX_SIZE);
+	s_AppAddress=APP_RUN_START_ADDR;
+	s_AppAddress_lzma=APP_BK_LZMA_ST_ADDR+sizeof(image_header_t);
+	lzma_update(MyRead,MyWrite);
+	(void)FlashErase(APP_BK_LZMA_ST_ADDR, APP_SOFTWARE_BK_LZMA_MAX_SIZE);
+}
+/*******************************************************************************
+* Function Name : main
+* Description : Main program
+* Input : None
+* Output : None
+* Return : None
+*******************************************************************************/
+void main(void)
+{
+	printk("\nBoot start... ");
+	printk(BOOT_VERSION);
+	printk("\nPress Esc key to update your APP!");
+	uart_console_dev = device_get_binding(CONFIG_UART_CONSOLE_ON_DEV_NAME);
+	if ((struct device *)0 == uart_console_dev)
+	{
+		return;
+	}
+	flash_dev = device_get_binding(FLASH_DEV_NAME);
+    if ((struct device *)0 == uart_console_dev)
+	{
+		return;
+	}
+	wdg_dev = device_get_binding(WATCHDOG_DEV_NAME);
+	if ((struct device *)0 == wdg_dev)
+	{
+		return;
+	}
+	WdgClear();
+	/*1-->等待按键动作*/
+	if(ESC != _inbyte(DLY_1S))
+	{   //未进入xmodem升级，查看是否有程序搬迁到运行区
+		if ((0xFFFFFFFF != *((unsigned int *)APP_BK_LZMA_ST_ADDR))
+			&&(XMODEM_OK == CheckImgHeader((unsigned char *)APP_BK_LZMA_ST_ADDR))
+		    &&(IH_LZMA_IMG == GetImageCompressType((unsigned char *)APP_BK_LZMA_ST_ADDR))
+		    &&(XMODEM_OK == CheckImgContent_Lzma(APP_BK_LZMA_ST_ADDR)))
+		{
+			UpdateRunApp_Lzma();
+		}
+		JumpToApp();
+	}
+	/*用户按下ESC按键*/
+	printk("\nPlease Download your APP:>\n");
+
+	/*2-->等待XMODEM下发文件*/
+	if(XMODEM_OK == xmodemReceive())
+	{
+	    //校验文件，搬迁程序到运行区等等
+		if (true == g_bImageLzma) 
+		{
+			if (XMODEM_OK == CheckImgContent_Lzma(APP_BK_LZMA_ST_ADDR))
+			{
+				UpdateRunApp_Lzma();
+			}
+			else
+			{
+				printk("\nUpdate app failed.Crc err!\n");
+			}		
+		}
+	}
+	JumpToApp();
+}
+
+
