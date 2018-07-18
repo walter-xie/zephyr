@@ -514,6 +514,18 @@ void uart_console_isr(struct device *unused)
 			continue;
 		}
 
+		if ('?' == byte) {
+			uart_poll_out(uart_console_dev, '?');
+			uart_poll_out(uart_console_dev, '\r');
+			uart_poll_out(uart_console_dev, '\n');
+			memcpy(cmd->line,"help",5);
+			cur = 0;
+			end = 0;
+			k_fifo_put(lines_queue, cmd);
+			cmd = NULL;
+			continue;
+		}
+
 		/* Handle special control characters */
 		if (!isprint(byte)) {
 			switch (byte) {
