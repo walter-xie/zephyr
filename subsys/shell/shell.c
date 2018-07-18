@@ -409,6 +409,10 @@ int shell_exec(char *line)
 			return app_cmd_handler(argc, argv);
 		}
 
+		if (!set_default_module(argv[0])) {
+			return 0;
+		}
+
 		printk("Unrecognized command: %s\n", argv[0]);
 		printk("Type 'help' for list of available commands\n");
 		return -EINVAL;
